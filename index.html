@@ -1,0 +1,1162 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>んぽちゃむルンバ</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #1a1a2e; display: flex; justify-content: center; align-items: center; height: 100vh; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+
+// =========================
+// Config
+// =========================
+const GW = 960, GH = 540;
+const RUMBA_RADIUS = 30;
+const RUMBA_MAX_SPEED = 1.5;
+const RUMBA_ACCEL = 0.2;
+const RUMBA_BOOST_MAX_SPEED = 6.0;
+const RUMBA_BOOST_ACCEL = 0.65;
+const RUMBA_FRICTION = 0.86;
+
+const CHAR_SIZE = 90; // 当たり判定用（正方形）
+const CHAR_FRICTION = 0.90;
+const CHAR_DRAG_W = Math.floor(CHAR_SIZE * 1.5);
+const CHAR_DRAG_H = CHAR_SIZE;
+// 立ち絵の描画サイズ（元画像比率に合わせる）
+const CHAR_STAND_H = 120;
+const CHAR_STAND_W = Math.floor(CHAR_STAND_H * (1728 / 2466)); // main.png比率
+
+const ATTACH_RANGE = 105;
+const DETACH_RANGE = 200;
+
+const SLIP_DURATION_SEC = 0.40;
+const REATTACH_COOLDOWN_SEC = 0.25;
+const DRAG_ANIM_FRAMES = 6; // dragging-1 ~ dragging-6
+const DRAG_ANIM_INTERVAL = 0.03; // 各フレーム0.03秒
+const DRAG_ANIM_DURATION = DRAG_ANIM_FRAMES * DRAG_ANIM_INTERVAL; // 合計0.3秒
+const DRAG_DRAW_SIZE = 130; // dragging画像の長辺サイズ（CHAR_SIZE=90より大きく）
+
+const MACARON_DRAW_H = 40;
+const MACARON_ATTRACT_FORCE = 0.35;
+const TOTAL_MACARONS = 10;
+const MACARON_SPEED = 0.8;
+const DRAG_SPEED_BASE = 8;       // 引きずり速度上限（初期）
+const DRAG_SPEED_PENALTY = 2.5;  // マカロン1個食べるごとに減速
+const CHAR_SIZE_GROW = 60;       // マカロン1個食べるごとにキャラ拡大
+
+const OBSTACLES = [];
+
+const EXIT_RECT = { x: GW - 110, y: GH - 110, w: 110, h: 110 };
+
+// =========================
+// Canvas setup with fullscreen scaling
+// =========================
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+let scale = 1, offsetX = 0, offsetY = 0, dpr = 1;
+
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  const ww = window.innerWidth, wh = window.innerHeight;
+  scale = Math.min(ww / GW, wh / GH);
+  canvas.width = ww * dpr;
+  canvas.height = wh * dpr;
+  canvas.style.width = ww + "px";
+  canvas.style.height = wh + "px";
+  offsetX = (ww - GW * scale) / 2;
+  offsetY = (wh - GH * scale) / 2;
+}
+window.addEventListener("resize", resize);
+resize();
+
+function applyTransform() {
+  ctx.setTransform(scale * dpr, 0, 0, scale * dpr, offsetX * dpr, offsetY * dpr);
+}
+
+// =========================
+// Helpers
+// =========================
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+function charSize() { return CHAR_SIZE + macaronsEaten * CHAR_SIZE_GROW; }
+function charDrawSize() { return DRAG_DRAW_SIZE + macaronsEaten * CHAR_SIZE_GROW; }
+function charStandH() { return CHAR_STAND_H + macaronsEaten * CHAR_SIZE_GROW; }
+function charStandW() { return Math.floor(charStandH() * (1728 / 2466)); }
+function macaronRadius(imgIdx) {
+  const img = images[macaronImgNames[imgIdx]];
+  if (!img) return 20;
+  const sc = MACARON_DRAW_H / img.naturalHeight;
+  return (img.naturalWidth * sc) / 2;
+}
+function vecLen(x, y) { return Math.hypot(x, y); }
+function normalize(x, y) { const l = vecLen(x, y); return l === 0 ? [0, 0] : [x / l, y / l]; }
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+function rectsCollide(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+function circleRectCollide(cx, cy, cr, r) {
+  const nx = clamp(cx, r.x, r.x + r.w);
+  const ny = clamp(cy, r.y, r.y + r.h);
+  const dx = cx - nx, dy = cy - ny;
+  return { hit: dx * dx + dy * dy <= cr * cr, dx, dy };
+}
+
+function resolveCircleRect(cx, cy, cr, vx, vy, r) {
+  const { hit, dx, dy } = circleRectCollide(cx, cy, cr, r);
+  if (!hit) return { cx, cy, vx, vy };
+  const dist = Math.hypot(dx, dy);
+  let nxDir, nyDir;
+  if (dist === 0) {
+    const left = Math.abs(cx - r.x), right = Math.abs(r.x + r.w - cx);
+    const top = Math.abs(cy - r.y), bottom = Math.abs(r.y + r.h - cy);
+    const m = Math.min(left, right, top, bottom);
+    if (m === left) { nxDir = -1; nyDir = 0; }
+    else if (m === right) { nxDir = 1; nyDir = 0; }
+    else if (m === top) { nxDir = 0; nyDir = -1; }
+    else { nxDir = 0; nyDir = 1; }
+    cx += nxDir * cr; cy += nyDir * cr;
+    if (nxDir !== 0) vx *= -0.3;
+    if (nyDir !== 0) vy *= -0.3;
+    return { cx, cy, vx, vy };
+  }
+  nxDir = dx / dist; nyDir = dy / dist;
+  cx += nxDir * (cr - dist); cy += nyDir * (cr - dist);
+  const vn = vx * nxDir + vy * nyDir;
+  if (vn < 0) { vx -= 1.3 * vn * nxDir; vy -= 1.3 * vn * nyDir; vx *= 0.75; vy *= 0.75; }
+  return { cx, cy, vx, vy };
+}
+
+function rectRectResolve(moving, vx, vy, solid) {
+  if (!rectsCollide(moving, solid)) return { r: moving, vx, vy };
+  if (vx > 0) { moving.x = solid.x - moving.w; vx *= -0.2; }
+  else if (vx < 0) { moving.x = solid.x + solid.w; vx *= -0.2; }
+  if (rectsCollide(moving, solid)) {
+    if (vy > 0) { moving.y = solid.y - moving.h; vy *= -0.2; }
+    else if (vy < 0) { moving.y = solid.y + solid.h; vy *= -0.2; }
+  }
+  return { r: moving, vx, vy };
+}
+
+function circleCircleResolve(cx, cy, cr, vx, vy, ox, oy, orad) {
+  const dx = cx - ox, dy = cy - oy, dist = Math.hypot(dx, dy);
+  if (dist < cr + orad) {
+    const [nx, ny] = dist === 0 ? [1, 0] : [dx / dist, dy / dist];
+    cx += nx * (cr + orad - dist); cy += ny * (cr + orad - dist);
+    const vn = vx * nx + vy * ny;
+    if (vn < 0) { vx -= 1.3 * vn * nx; vy -= 1.3 * vn * ny; vx *= 0.75; vy *= 0.75; }
+  }
+  return { cx, cy, vx, vy };
+}
+
+function resolveCharCircle(cx, cy, cw, ch, vx, vy, ox, oy, orad) {
+  const closestX = clamp(ox, cx, cx + cw), closestY = clamp(oy, cy, cy + ch);
+  const dx = closestX - ox, dy = closestY - oy, dist = Math.hypot(dx, dy);
+  if (dist < orad) {
+    const [nx, ny] = dist === 0 ? [1, 0] : [dx / dist, dy / dist];
+    cx += nx * (orad - dist); cy += ny * (orad - dist);
+    const vn = vx * nx + vy * ny;
+    if (vn < 0) { vx -= 1.3 * vn * nx; vy -= 1.3 * vn * ny; vx *= 0.75; vy *= 0.75; }
+  }
+  return { cx, cy, vx, vy };
+}
+
+// =========================
+// Sound (Web Audio API)
+// =========================
+let audioCtx = null;
+function ensureAudio() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === "suspended") audioCtx.resume();
+}
+
+function playTone(freqStart, freqEnd, duration, volume = 0.3, type = "sine") {
+  ensureAudio();
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type;
+  osc.connect(gain); gain.connect(audioCtx.destination);
+  osc.frequency.setValueAtTime(freqStart, audioCtx.currentTime);
+  osc.frequency.linearRampToValueAtTime(freqEnd, audioCtx.currentTime + duration);
+  gain.gain.setValueAtTime(volume, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+  osc.start(); osc.stop(audioCtx.currentTime + duration);
+}
+
+// Crying sound (plays once per drag; when it ends, character detaches)
+// 通常: crying.wav, ダッシュ: crying-dash.wav
+let cryingAudio = null;
+let cryingDashAudio = null;
+let cryingCurrentMode = ""; // "normal" or "dash"
+
+function initCryingAudio() {
+  if (!cryingAudio) {
+    cryingAudio = new Audio("images/crying.wav");
+    cryingAudio.loop = false;
+    cryingAudio.addEventListener("ended", onCryingEnded);
+  }
+  if (!cryingDashAudio) {
+    cryingDashAudio = new Audio("images/crying-dash.wav");
+    cryingDashAudio.loop = false;
+    cryingDashAudio.addEventListener("ended", onCryingEnded);
+  }
+}
+
+function onCryingEnded() {
+  if (attached) {
+    attached = false;
+    slipTimer = SLIP_DURATION_SEC;
+    reattachCooldown = REATTACH_COOLDOWN_SEC;
+    playSlip();
+    screenShake = 0.12;
+  }
+  cryingCurrentMode = "";
+}
+
+function startCrying(dash) {
+  initCryingAudio();
+  const wantMode = dash ? "dash" : "normal";
+  const wantAudio = dash ? cryingDashAudio : cryingAudio;
+  const otherAudio = dash ? cryingAudio : cryingDashAudio;
+  // モード切替時は再生し直す
+  if (cryingCurrentMode && cryingCurrentMode !== wantMode) {
+    if (!otherAudio.paused) { otherAudio.pause(); otherAudio.currentTime = 0; }
+    cryingCurrentMode = "";
+  }
+  if (wantAudio.paused) {
+    wantAudio.currentTime = 0;
+    wantAudio.play().catch(() => {});
+    cryingCurrentMode = wantMode;
+  }
+}
+
+function stopCrying() {
+  if (cryingAudio && !cryingAudio.paused) { cryingAudio.pause(); cryingAudio.currentTime = 0; }
+  if (cryingDashAudio && !cryingDashAudio.paused) { cryingDashAudio.pause(); cryingDashAudio.currentTime = 0; }
+  cryingCurrentMode = "";
+}
+
+function playConnect() { playTone(400, 800, 0.1, 0.2); }
+function playSlip() { playTone(600, 300, 0.15, 0.15, "triangle"); }
+function playCollect() {
+  ensureAudio();
+  playTone(523, 523, 0.1, 0.15);
+  setTimeout(() => playTone(659, 659, 0.1, 0.15), 100);
+}
+function playClear() {
+  ensureAudio();
+  [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => playTone(f, f, 0.15, 0.2), i * 130));
+}
+
+// =========================
+// Image loading
+// =========================
+const images = {};
+const imageNames = [
+  "ルンバ.png", "main.png",
+  "dragging-1.png", "dragging-2.png", "dragging-3.png", "dragging-4.png", "dragging-5.png", "dragging-6.png", "dragging-7.png",
+  "makaron.png", "makaron2.png", "makaron3.png", "goal.png",
+];
+let imagesLoaded = 0;
+
+function loadImages(cb) {
+  if (imageNames.length === 0) { cb(); return; }
+  imageNames.forEach(name => {
+    const img = new Image();
+    img.onload = () => { images[name] = img; if (++imagesLoaded >= imageNames.length) cb(); };
+    img.onerror = () => { if (++imagesLoaded >= imageNames.length) cb(); };
+    img.src = "images/" + encodeURIComponent(name);
+  });
+}
+
+// =========================
+// Particles
+// =========================
+let particles = [];
+
+function spawnParticles(x, y, color, count = 10, speed = 3.0, lifetime = 0.5) {
+  for (let i = 0; i < count; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const s = speed * (0.5 + Math.random() * 0.5);
+    particles.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s,
+      color, life: lifetime, maxLife: lifetime, size: 2 + Math.random() * 4 });
+  }
+}
+
+function spawnConfetti(count = 50) {
+  const colors = ["#ff6b6b","#51cf66","#339af0","#fcc419","#cc5de8","#22b8cf","#ff922b"];
+  for (let i = 0; i < count; i++) {
+    const a = Math.PI * 0.25 + Math.random() * Math.PI * 0.5;
+    const s = 2 + Math.random() * 4;
+    particles.push({
+      x: Math.random() * GW, y: -20 + Math.random() * (GH / 3 + 20),
+      vx: Math.cos(a) * s * (Math.random() < 0.5 ? -1 : 1), vy: Math.sin(a) * s,
+      color: colors[Math.floor(Math.random() * colors.length)],
+      life: 2.0, maxLife: 2.0, size: 3 + Math.random() * 5
+    });
+  }
+}
+
+function updateParticles(dt) {
+  for (const p of particles) { p.x += p.vx; p.y += p.vy; p.vy += 1.5; p.life -= dt; }
+  particles = particles.filter(p => p.life > 0);
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    const alpha = Math.max(0, p.life / p.maxLife);
+    const sz = Math.max(1, p.size * alpha);
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, sz, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+// =========================
+// Input
+// =========================
+const keys = {};
+document.addEventListener("keydown", e => {
+  keys[e.code] = true;
+  handleKeyDown(e.code);
+  if (["ArrowUp","ArrowDown","ArrowLeft","ArrowRight","Space"].includes(e.code)) e.preventDefault();
+});
+document.addEventListener("keyup", e => { keys[e.code] = false; });
+
+// Touch/mouse virtual joystick
+let touchActive = false, touchStartX = 0, touchStartY = 0, touchDX = 0, touchDY = 0;
+const TOUCH_DEAD = 15, TOUCH_MAX = 80;
+
+function screenToGame(sx, sy) {
+  return [(sx - offsetX) / scale, (sy - offsetY) / scale];
+}
+
+canvas.addEventListener("pointerdown", e => {
+  ensureAudio();
+  if (gameState === "title") { gameState = "howto"; return; }
+  if (gameState === "howto") { resetGame(); return; }
+  if (gameState === "cleared") { resetGame(); return; }
+  if (gameState === "gameover") { resetGame(); return; }
+  if (gameState === "paused") { gameState = "playing"; return; }
+  touchActive = true; touchStartX = e.clientX; touchStartY = e.clientY; touchDX = 0; touchDY = 0;
+});
+canvas.addEventListener("pointermove", e => {
+  if (!touchActive) return;
+  touchDX = e.clientX - touchStartX; touchDY = e.clientY - touchStartY;
+});
+canvas.addEventListener("pointerup", () => { touchActive = false; touchDX = 0; touchDY = 0; });
+canvas.addEventListener("pointercancel", () => { touchActive = false; touchDX = 0; touchDY = 0; });
+
+// =========================
+// Game State
+// =========================
+let gameState = "title";
+let rumbaX, rumbaY, rumbaVX, rumbaVY, rumbaFacingX, rumbaFacingY, dragFlipped;
+let charX, charY, charVX, charVY;
+let attached, hasBeenAttached, slipTimer, reattachCooldown;
+let elapsedTime;
+let macarons = [], collectionEffects = [];
+let ropePoints = []; // visual rope segments
+let screenShake = 0;
+let dragAnimTimer = 0;
+let gameOverTime = 0; // ゲームオーバー開始時刻
+let macaronsEaten = 0; // dragging-1~6 アニメーションタイマー
+let bestTime = parseFloat(localStorage.getItem("npochamu_best") || "0");
+
+function handleKeyDown(code) {
+  ensureAudio();
+  if (gameState === "title") {
+    if (code === "Space") gameState = "howto";
+  } else if (gameState === "howto") {
+    if (code === "Space") resetGame();
+  } else if (gameState === "playing") {
+    if (code === "KeyR") resetGame();
+    else if (code === "Escape" || code === "KeyP") gameState = "paused";
+  } else if (gameState === "paused") {
+    if (code === "Escape" || code === "KeyP") gameState = "playing";
+    else if (code === "KeyR") resetGame();
+  } else if (gameState === "cleared") {
+    if (code === "Space" || code === "KeyR") resetGame();
+  } else if (gameState === "gameover") {
+    if (code === "Space" || code === "KeyR") resetGame();
+  }
+}
+
+function generateMacarons() {
+  const macs = [];
+  for (let i = 0; i < TOTAL_MACARONS; i++) {
+    for (let tries = 0; tries < 300; tries++) {
+      const mx = 40 + Math.random() * (GW - 80);
+      const my = 40 + Math.random() * (GH - 80);
+      const mr = { x: mx - 20, y: my - 20, w: 40, h: 40 };
+      let ok = !rectsCollide(mr, EXIT_RECT);
+      if (ok) for (const obs of OBSTACLES) {
+        if (obs.shape === "rect" && rectsCollide(mr, obs.rect)) { ok = false; break; }
+        if (obs.shape === "circle" && vecLen(mx - obs.pos[0], my - obs.pos[1]) < obs.radius + 30) { ok = false; break; }
+      }
+      if (ok) for (const mac of macs) {
+        if (vecLen(mx - mac.pos[0], my - mac.pos[1]) < 50) { ok = false; break; }
+      }
+      if (ok) {
+        const a = Math.random() * Math.PI * 2;
+        macs.push({ pos: [mx, my], vx: Math.cos(a) * MACARON_SPEED, vy: Math.sin(a) * MACARON_SPEED, imgIdx: Math.floor(Math.random() * 3) });
+        break;
+      }
+    }
+  }
+  return macs;
+}
+
+function resetGame() {
+  rumbaX = 150; rumbaY = GH - 150; rumbaVX = 0; rumbaVY = 0;
+  rumbaFacingX = 1; rumbaFacingY = 0; dragFlipped = false;
+  charX = 100; charY = 100; charVX = 0; charVY = 0;
+  attached = false; hasBeenAttached = false;
+  slipTimer = 0; reattachCooldown = 0;
+  elapsedTime = 0;
+  macarons = generateMacarons(); collectionEffects = [];
+  particles = []; ropePoints = []; screenShake = 0; dragAnimTimer = 0; macaronsEaten = 0;
+  gameState = "playing";
+}
+
+// =========================
+// Update
+// =========================
+function update(dt) {
+  if (gameState !== "playing") { stopCrying(); updateParticles(dt); updateEffects(dt); return; }
+
+  elapsedTime += dt;
+  if (slipTimer > 0) slipTimer = Math.max(0, slipTimer - dt);
+  if (reattachCooldown > 0) reattachCooldown = Math.max(0, reattachCooldown - dt);
+  if (screenShake > 0) screenShake = Math.max(0, screenShake - dt);
+  if (dragAnimTimer > 0) dragAnimTimer = Math.max(0, dragAnimTimer - dt);
+
+  // Roomba input (keyboard + touch) — Shift で加速
+  const boosting = !!(keys["ShiftLeft"] || keys["ShiftRight"]);
+  const accel = boosting ? RUMBA_BOOST_ACCEL : RUMBA_ACCEL;
+  const maxSpd = boosting ? RUMBA_BOOST_MAX_SPEED : RUMBA_MAX_SPEED;
+
+  let ax = 0, ay = 0;
+  if (keys["ArrowLeft"] || keys["KeyA"]) ax -= accel;
+  if (keys["ArrowRight"] || keys["KeyD"]) ax += accel;
+  if (keys["ArrowUp"] || keys["KeyW"]) ay -= accel;
+  if (keys["ArrowDown"] || keys["KeyS"]) ay += accel;
+
+  if (touchActive) {
+    const mag = Math.hypot(touchDX, touchDY);
+    if (mag > TOUCH_DEAD) {
+      const ratio = Math.min(1, (mag - TOUCH_DEAD) / (TOUCH_MAX - TOUCH_DEAD));
+      ax += (touchDX / mag) * accel * ratio;
+      ay += (touchDY / mag) * accel * ratio;
+    }
+  }
+
+  rumbaVX += ax; rumbaVY += ay;
+  const sp = vecLen(rumbaVX, rumbaVY);
+  if (sp > maxSpd) {
+    const [nx, ny] = normalize(rumbaVX, rumbaVY);
+    rumbaVX = nx * maxSpd; rumbaVY = ny * maxSpd;
+  }
+  rumbaVX *= RUMBA_FRICTION; rumbaVY *= RUMBA_FRICTION;
+
+  if (vecLen(rumbaVX, rumbaVY) > 0.3) {
+    [rumbaFacingX, rumbaFacingY] = normalize(rumbaVX, rumbaVY);
+    if (rumbaFacingX < -0.4) dragFlipped = true;
+    else if (rumbaFacingX > 0.4) dragFlipped = false;
+  }
+
+  rumbaX += rumbaVX; rumbaY += rumbaVY;
+  rumbaX = clamp(rumbaX, RUMBA_RADIUS, GW - RUMBA_RADIUS);
+  rumbaY = clamp(rumbaY, RUMBA_RADIUS, GH - RUMBA_RADIUS);
+
+  for (const obs of OBSTACLES) {
+    let res;
+    if (obs.shape === "rect") res = resolveCircleRect(rumbaX, rumbaY, RUMBA_RADIUS, rumbaVX, rumbaVY, obs.rect);
+    else res = circleCircleResolve(rumbaX, rumbaY, RUMBA_RADIUS, rumbaVX, rumbaVY, obs.pos[0], obs.pos[1], obs.radius);
+    rumbaX = res.cx; rumbaY = res.cy; rumbaVX = res.vx; rumbaVY = res.vy;
+  }
+
+  // Drag force (アニメ中も引きずる)
+  if (attached) {
+    // キャラをルンバの左上に配置（ルンバがキャラの右下に見える）
+    const cs = charSize();
+    const targetX = rumbaX - cs * 1.33;
+    const targetY = rumbaY - cs * 0.75;
+    charVX = (targetX - charX) * 0.4 + rumbaVX * 0.6;
+    charVY = (targetY - charY) * 0.4 + rumbaVY * 0.6;
+    const dragMaxSpd = DRAG_SPEED_BASE - macaronsEaten * DRAG_SPEED_PENALTY;
+    const dragSpd = vecLen(charVX, charVY);
+    if (dragSpd > dragMaxSpd) { charVX = charVX / dragSpd * dragMaxSpd; charVY = charVY / dragSpd * dragMaxSpd; }
+  } else {
+    charVX *= CHAR_FRICTION; charVY *= CHAR_FRICTION;
+  }
+
+  charX += charVX; charY += charVY;
+  const csNow = charSize();
+  charX = clamp(charX, 0, GW - csNow);
+  charY = clamp(charY, 0, GH - csNow);
+
+  let charRect = { x: charX, y: charY, w: csNow, h: csNow };
+  for (const obs of OBSTACLES) {
+    if (obs.shape === "rect") {
+      const res = rectRectResolve({ ...charRect }, charVX, charVY, obs.rect);
+      charRect = res.r; charVX = res.vx; charVY = res.vy;
+    }
+  }
+  charX = charRect.x; charY = charRect.y;
+
+  for (const obs of OBSTACLES) {
+    if (obs.shape === "circle") {
+      const res = resolveCharCircle(charX, charY, csNow, csNow, charVX, charVY, obs.pos[0], obs.pos[1], obs.radius);
+      charX = res.cx; charY = res.cy; charVX = res.vx; charVY = res.vy;
+    }
+  }
+
+  // Macaron movement (bounce off edges)
+  for (const mac of macarons) {
+    mac.pos[0] += mac.vx;
+    mac.pos[1] += mac.vy;
+    if (mac.pos[0] < 20 || mac.pos[0] > GW - 20) { mac.vx *= -1; mac.pos[0] = clamp(mac.pos[0], 20, GW - 20); }
+    if (mac.pos[1] < 20 || mac.pos[1] > GH - 20) { mac.vy *= -1; mac.pos[1] = clamp(mac.pos[1], 20, GH - 20); }
+  }
+
+  // Macaron attraction
+  if (hasBeenAttached && !attached) {
+    let closestDist = 99999, closestIdx = -1;
+    const cx = charX + csNow / 2, cy = charY + csNow / 2;
+    for (let i = 0; i < macarons.length; i++) {
+      const d = vecLen(macarons[i].pos[0] - cx, macarons[i].pos[1] - cy);
+      if (d < closestDist) { closestDist = d; closestIdx = i; }
+    }
+    if (closestIdx !== -1) {
+      const mr = macaronRadius(macarons[closestIdx].imgIdx);
+      const attractRange = mr + csNow / 2;
+      const eatRange = mr + csNow / 4;
+      if (closestDist < attractRange) {
+      const mac = macarons[closestIdx];
+      const [nxm, nym] = normalize(mac.pos[0] - cx, mac.pos[1] - cy);
+      charVX += nxm * MACARON_ATTRACT_FORCE;
+      charVY += nym * MACARON_ATTRACT_FORCE;
+      if (closestDist < eatRange) {
+        const eaten = macarons.splice(closestIdx, 1)[0];
+        macaronsEaten++;
+        playCollect();
+        if (macaronsEaten >= 3) {
+          gameState = "gameover"; attached = false; stopCrying(); screenShake = 0;
+          gameOverTime = performance.now();
+          return;
+        }
+      }
+      }
+    }
+  }
+
+  // Attach/detach logic
+  const cxC = charX + csNow / 2, cyC = charY + csNow / 2;
+  const dist = vecLen(cxC - rumbaX, cyC - rumbaY);
+
+  if (attached) {
+    for (const mac of macarons) {
+      const mrad = macaronRadius(mac.imgIdx);
+      if (vecLen(mac.pos[0] - cxC, mac.pos[1] - cyC) < mrad + csNow / 2) {
+        attached = false;
+        slipTimer = SLIP_DURATION_SEC * 1.5;
+        reattachCooldown = REATTACH_COOLDOWN_SEC;
+        playSlip(); screenShake = 0.15;
+        break;
+      }
+    }
+  }
+
+  if (slipTimer > 0) attached = false;
+
+  if (!attached && slipTimer === 0 && reattachCooldown === 0 && dist <= ATTACH_RANGE) {
+    attached = true; hasBeenAttached = true;
+    dragAnimTimer = DRAG_ANIM_DURATION; // dragging-1~6 アニメ開始
+    playConnect();
+    spawnParticles(rumbaX, rumbaY, "#b4d2ff", 10, 3.0, 0.35);
+  }
+
+  if (attached && dist >= DETACH_RANGE) { attached = false; playSlip(); screenShake = 0.1; }
+
+
+  // Rope visual
+  if (attached) {
+    const rCX = charX + csNow / 2, rCY = charY + csNow / 2;
+    const segs = 6;
+    ropePoints = [];
+    for (let i = 0; i <= segs; i++) {
+      const t = i / segs;
+      const rx = lerp(rumbaX, rCX, t);
+      const ry = lerp(rumbaY, rCY, t);
+      const sag = Math.sin(t * Math.PI) * 12;
+      ropePoints.push([rx, ry + sag]);
+    }
+  } else {
+    ropePoints = [];
+  }
+
+  // Crying sound control (引きずり中＝attached かつ アニメ完了後)
+  if (attached && dragAnimTimer <= 0) startCrying(boosting);
+  else stopCrying();
+
+  // Clear check
+  if (rectsCollide({ x: charX, y: charY, w: csNow, h: csNow }, EXIT_RECT)) {
+    gameState = "cleared"; attached = false; slipTimer = 0;
+    if (bestTime === 0 || elapsedTime < bestTime) {
+      bestTime = elapsedTime;
+      localStorage.setItem("npochamu_best", bestTime.toString());
+    }
+    playClear(); spawnConfetti(60);
+  }
+
+  updateParticles(dt);
+  updateEffects(dt);
+}
+
+function updateEffects(dt) {
+  for (const e of collectionEffects) e.timer -= dt;
+  collectionEffects = collectionEffects.filter(e => e.timer > 0);
+}
+
+// =========================
+// Draw
+// =========================
+const macaronImgNames = ["makaron.png", "makaron2.png", "makaron3.png"];
+
+function drawImg(name, x, y, w, h, flipH = false) {
+  const img = images[name];
+  if (!img) return false;
+  ctx.save();
+  if (flipH) { ctx.translate(x + w, y); ctx.scale(-1, 1); ctx.drawImage(img, 0, 0, w, h); }
+  else ctx.drawImage(img, x, y, w, h);
+  ctx.restore();
+  return true;
+}
+
+function roundRect(x, y, w, h, r, fill, stroke, sw) {
+  ctx.beginPath(); ctx.roundRect(x, y, w, h, r);
+  if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+  if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = sw || 2; ctx.stroke(); }
+}
+
+function drawShadow(x, y, w, h, blur) {
+  ctx.save();
+  ctx.globalAlpha = 0.18;
+  ctx.fillStyle = "#000";
+  ctx.beginPath();
+  ctx.ellipse(x + w / 2, y + h - 2, w * 0.4, h * 0.12, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function draw() {
+  const now = performance.now();
+
+  // Clear full canvas with letterbox color
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = "#1a1a2e";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Apply game transform with optional screen shake
+  let shakeX = 0, shakeY = 0;
+  if (screenShake > 0) {
+    shakeX = (Math.random() - 0.5) * 8 * (screenShake / 0.15);
+    shakeY = (Math.random() - 0.5) * 8 * (screenShake / 0.15);
+  }
+  ctx.setTransform(scale * dpr, 0, 0, scale * dpr, (offsetX + shakeX * scale) * dpr, (offsetY + shakeY * scale) * dpr);
+
+  if (gameState === "title") {
+    drawTitleScreen(now);
+    return;
+  }
+  if (gameState === "howto") {
+    drawHowtoScreen(now);
+    return;
+  }
+
+  // Background gradient
+  const grad = ctx.createLinearGradient(0, 0, 0, GH);
+  grad.addColorStop(0, "#b8e0f0");
+  grad.addColorStop(1, "#e8f4f8");
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, GW, GH);
+
+  // Floor pattern (subtle grid)
+  ctx.strokeStyle = "rgba(150,190,210,0.25)";
+  ctx.lineWidth = 1;
+  for (let gx = 0; gx < GW; gx += 60) { ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, GH); ctx.stroke(); }
+  for (let gy = 0; gy < GH; gy += 60) { ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(GW, gy); ctx.stroke(); }
+
+  // Macarons (behind character)
+  for (const mac of macarons) {
+    const imgName = macaronImgNames[mac.imgIdx];
+    const img = images[imgName];
+    if (img) {
+      const sc = 40 / img.naturalHeight;
+      const dw = img.naturalWidth * sc, dh = 40;
+      ctx.drawImage(img, mac.pos[0] - dw / 2, mac.pos[1] - dh / 2, dw, dh);
+    } else {
+      ctx.fillStyle = "#ff6b6b";
+      ctx.beginPath(); ctx.arc(mac.pos[0], mac.pos[1], 8, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+
+  // EXIT (goal)
+  const goalImg = images["goal.png"];
+  if (goalImg) {
+    ctx.drawImage(goalImg, EXIT_RECT.x, EXIT_RECT.y, EXIT_RECT.w, EXIT_RECT.h);
+  } else {
+    roundRect(EXIT_RECT.x, EXIT_RECT.y, EXIT_RECT.w, EXIT_RECT.h, 14, "rgb(60,200,120)");
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.font = "bold 34px sans-serif"; ctx.fillStyle = "#fff";
+    ctx.fillText("GOAL", EXIT_RECT.x + EXIT_RECT.w / 2, EXIT_RECT.y + EXIT_RECT.h / 2);
+  }
+
+  // Maze walls
+  for (const obs of OBSTACLES) {
+    if (obs.shape === "rect") {
+      const r = obs.rect;
+      ctx.fillStyle = WALL_COLOR;
+      ctx.fillRect(r.x, r.y, r.w, r.h);
+      ctx.strokeStyle = WALL_BORDER;
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(r.x, r.y, r.w, r.h);
+    }
+  }
+
+  // Character shadow
+
+  // Character
+  const csD = charSize();
+  const dds = charDrawSize();
+  const csH = charStandH();
+  const csW = charStandW();
+  if (attached) {
+    let frameName;
+    if (dragAnimTimer > 0) {
+      const elapsed = DRAG_ANIM_DURATION - dragAnimTimer;
+      const frameIdx = Math.min(DRAG_ANIM_FRAMES - 1, Math.floor(elapsed / DRAG_ANIM_INTERVAL));
+      frameName = `dragging-${frameIdx + 1}.png`;
+    } else {
+      frameName = "dragging-7.png";
+    }
+    const img = images[frameName];
+    if (img) {
+      const aspect = img.naturalWidth / img.naturalHeight;
+      let dw, dh;
+      if (aspect >= 1) { dw = dds; dh = Math.floor(dds / aspect); }
+      else { dh = dds; dw = Math.floor(dds * aspect); }
+      const dx = (csD - dw) / 2;
+      const dy = csD - dh;
+      drawImg(frameName, charX + dx, charY + dy, dw, dh, false);
+    } else {
+      roundRect(charX, charY, csD, csD, 10, "rgb(255,170,80)");
+    }
+  } else {
+    const dx = (csD - csW) / 2;
+    const dy = csD - csH;
+    if (!drawImg("main.png", charX + dx, charY + dy, csW, csH)) {
+      roundRect(charX, charY, csD, csD, 10, "rgb(255,170,80)");
+    }
+  }
+
+  // Roomba shadow
+
+  // Roomba
+  if (!drawImg("ルンバ.png", rumbaX - RUMBA_RADIUS, rumbaY - RUMBA_RADIUS, RUMBA_RADIUS * 2, RUMBA_RADIUS * 2)) {
+    ctx.fillStyle = "rgb(240,240,255)";
+    ctx.beginPath(); ctx.arc(rumbaX, rumbaY, RUMBA_RADIUS, 0, Math.PI * 2); ctx.fill();
+  }
+
+  // Particles
+  drawParticles();
+
+  // HUD (hide during gameover)
+  if (gameState !== "gameover") drawHUD(now);
+
+  // Overlays
+  if (gameState === "paused") drawPauseOverlay();
+  else if (gameState === "cleared") drawClearOverlay(now);
+  else if (gameState === "gameover") drawGameOverOverlay(now);
+
+  ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+}
+
+function drawTitleScreen(now) {
+  // Background
+  const grad = ctx.createLinearGradient(0, 0, 0, GH);
+  grad.addColorStop(0, "#b8e0f0");
+  grad.addColorStop(1, "#e8f4f8");
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, GW, GH);
+
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+
+  // Title
+  ctx.save();
+  ctx.shadowColor = "rgba(40,100,140,0.3)";
+  ctx.shadowBlur = 15;
+  ctx.font = `bold ${Math.floor(GW * 0.065)}px Impact, "Arial Black", sans-serif`;
+  ctx.fillStyle = "#2c5364";
+  ctx.fillText("んぽちゃむルンバ", GW / 2, GH * 0.18);
+  ctx.restore();
+
+  // Subtitle
+  ctx.font = `${Math.floor(GW * 0.02)}px sans-serif`;
+  ctx.fillStyle = "#5a8a9a";
+  ctx.fillText("ルンバでんぽちゃむをきみまろの元まで連れて行こう！", GW / 2, GH * 0.27);
+
+  // Character images (centered, larger)
+  const imgY = GH * 0.33;
+  if (images["main.png"]) {
+    const th = 180;
+    const tw = Math.floor(th * (1728 / 2466));
+    ctx.drawImage(images["main.png"], GW / 2 - tw - 20, imgY, tw, th);
+  }
+  if (images["ルンバ.png"]) {
+    ctx.drawImage(images["ルンバ.png"], GW / 2 + 20, imgY + 30, 120, 120);
+  }
+
+  // Best time
+  if (bestTime > 0) {
+    const bm = String(Math.floor(bestTime / 60)).padStart(2, "0");
+    const bs = String(Math.floor(bestTime) % 60).padStart(2, "0");
+    ctx.font = `bold ${Math.floor(GW * 0.02)}px monospace`;
+    ctx.fillStyle = "#2a7a4a";
+    ctx.fillText(`BEST  ${bm}:${bs}`, GW / 2, GH * 0.82);
+  }
+
+  // Start prompt (blink)
+  const blink = Math.floor(now / 500) % 2 === 0;
+  if (blink) {
+    ctx.font = `bold ${Math.floor(GW * 0.03)}px sans-serif`;
+    ctx.fillStyle = "#2a7a4a";
+    ctx.fillText("SPACE / タップ でスタート", GW / 2, GH - 40);
+  }
+}
+
+function drawHowtoScreen(now) {
+  // Background (same as gameplay)
+  const grad = ctx.createLinearGradient(0, 0, 0, GH);
+  grad.addColorStop(0, "#b8e0f0");
+  grad.addColorStop(1, "#e8f4f8");
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, GW, GH);
+
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+
+  // Title
+  ctx.font = `bold ${Math.floor(GW * 0.04)}px Impact, "Arial Black", sans-serif`;
+  ctx.fillStyle = "#2c5364";
+  ctx.fillText("ゲーム説明", GW / 2, 40);
+
+  // Rule cards
+  const cards = [
+    {
+      title: "1. ルンバでんぽちゃむに近づこう",
+      desc: "近づくと自動でくっつくよ！",
+      img: "ルンバ.png",
+    },
+    {
+      title: "2. きみまろを目指して進もう！",
+      desc: "きみまろは右下で待ってるよ\nルンバできみまろの元まで引きずろう！",
+      img: "goal.png",
+    },
+    {
+      title: "3. マカロンに注意！",
+      desc: "マカロンを3個食べるとGAME OVER！\n食べるたびに重くなるよ...",
+      img: "makaron.png",
+    },
+  ];
+
+  const cardW = 280, cardH = 130, cardGap = 16;
+  const totalW = cards.length * cardW + (cards.length - 1) * cardGap;
+  let cx = (GW - totalW) / 2;
+  const cy = 75;
+
+  for (const card of cards) {
+    // Card background
+    ctx.save();
+    ctx.shadowColor = "rgba(0,0,0,0.1)";
+    ctx.shadowBlur = 8;
+    ctx.shadowOffsetY = 3;
+    ctx.fillStyle = "rgba(255,255,255,0.5)";
+    ctx.beginPath(); ctx.roundRect(cx, cy, cardW, cardH, 12); ctx.fill();
+    ctx.restore();
+
+    // Icon
+    const img = images[card.img];
+    if (img) {
+      const isMacaron = card.img.startsWith("makaron");
+      const isGoal = card.img === "goal.png";
+      const iconSz = isMacaron ? 70 : isGoal ? 40 : 56;
+      const iconY = isMacaron ? 14 : 8;
+      const aspect = img.naturalWidth / img.naturalHeight;
+      const iw = aspect >= 1 ? iconSz : iconSz * aspect;
+      const ih = aspect >= 1 ? iconSz / aspect : iconSz;
+      ctx.drawImage(img, cx + (cardW - iw) / 2, cy + iconY, iw, ih);
+    }
+
+    // Card title
+    ctx.font = "bold 15px sans-serif";
+    ctx.fillStyle = "#333";
+    ctx.fillText(card.title, cx + cardW / 2, cy + 72);
+
+    // Card desc
+    ctx.font = "13px sans-serif";
+    ctx.fillStyle = "#666";
+    const descLines = card.desc.split("\n");
+    let dy = cy + 93;
+    for (const line of descLines) {
+      ctx.fillText(line, cx + cardW / 2, dy);
+      dy += 17;
+    }
+
+    cx += cardW + cardGap;
+  }
+
+  // Tips section
+  const tipsY = cy + cardH + 30;
+  ctx.font = `bold ${Math.floor(GW * 0.025)}px sans-serif`;
+  ctx.fillStyle = "#2c5364";
+  ctx.fillText("～注意～", GW / 2, tipsY);
+
+  const tips = [
+    "Shift を押しながらだとダッシュ！ でもんぽちゃむが嫌がってすぐ離れちゃうよ",
+    "あと、マカロンを食べるとんぽちゃむが大きくなって引きずりにくくなるから気をつけて！",
+  ];
+  ctx.font = "14px sans-serif";
+  ctx.fillStyle = "#555";
+  let tipY = tipsY + 34;
+  for (const tip of tips) {
+    ctx.fillText(tip, GW / 2, tipY);
+    tipY += 22;
+  }
+
+  // Controls preview
+  const ctrlY = tipY + 28;
+  ctx.font = `bold ${Math.floor(GW * 0.025)}px sans-serif`;
+  ctx.fillStyle = "#2c5364";
+  ctx.fillText("操作", GW / 2, ctrlY);
+
+  const controls = [
+    { key: "↑↓←→ / WASD", label: "移動" },
+    { key: "Shift", label: "ダッシュ" },
+  ];
+  let cky = ctrlY + 34;
+  for (const c of controls) {
+    // Key cap
+    ctx.font = "bold 14px monospace";
+    const kw = ctx.measureText(c.key).width + 14;
+    const kh = 26;
+    const kx = GW / 2 - kw / 2 - 30;
+    ctx.save();
+    ctx.shadowColor = "rgba(0,0,0,0.2)";
+    ctx.shadowBlur = 3;
+    ctx.shadowOffsetY = 2;
+    ctx.fillStyle = "#fff";
+    ctx.beginPath(); ctx.roundRect(kx, cky - kh / 2, kw, kh, 5); ctx.fill();
+    ctx.restore();
+    ctx.fillStyle = "#333";
+    ctx.font = "bold 14px monospace";
+    ctx.textAlign = "center";
+    ctx.fillText(c.key, kx + kw / 2, cky);
+    // Label
+    ctx.font = "14px sans-serif";
+    ctx.fillStyle = "#555";
+    ctx.textAlign = "left";
+    ctx.fillText(c.label, kx + kw + 8, cky);
+    ctx.textAlign = "center";
+    cky += 34;
+  }
+
+  // Start prompt (blink)
+  const blink = Math.floor(now / 500) % 2 === 0;
+  if (blink) {
+    ctx.font = "bold 26px sans-serif";
+    ctx.fillStyle = "#2a7a4a";
+    ctx.fillText("SPACE / タップ でゲーム開始！", GW / 2, GH - 30);
+  }
+}
+
+function drawHUD(now) {
+  // --- Timer section (left, white bg with border) ---
+  const mins = String(Math.floor(elapsedTime / 60)).padStart(2, "0");
+  const secs = String(Math.floor(elapsedTime) % 60).padStart(2, "0");
+  const ms = String(Math.floor((elapsedTime % 1) * 1000)).padStart(3, "0");
+  const timerStr = `${mins}:${secs}.${ms}`;
+  const timerFs = Math.floor(clamp(GW * 0.05, 40, 80));
+  ctx.font = `bold ${timerFs}px Impact, "Arial Black", sans-serif`;
+  ctx.textAlign = "left"; ctx.textBaseline = "top";
+  ctx.fillStyle = "#000";
+  ctx.fillText(timerStr, 22, 16);
+
+  // --- Macaron count (below timer) ---
+  if (macaronsEaten > 0) {
+    const macImg = images["makaron.png"];
+    const mcy = 90;
+    if (macImg) {
+      const msc = 26 / macImg.naturalHeight;
+      const miw = macImg.naturalWidth * msc, mih = 26;
+      // White background section
+      ctx.font = "bold 22px sans-serif";
+      const txtW = ctx.measureText("x" + macaronsEaten).width;
+      const secW = miw + 4 + txtW + 16;
+      const secH = mih + 10;
+      roundRect(18, mcy - 5, secW, secH, 8, "#fff");
+      ctx.drawImage(macImg, 24, mcy, miw, mih);
+      ctx.font = "bold 22px sans-serif";
+      ctx.textAlign = "left"; ctx.textBaseline = "middle";
+      ctx.fillStyle = "#000";
+      ctx.fillText("x" + macaronsEaten, 24 + miw + 4, mcy + mih / 2);
+    }
+  }
+
+  // --- Key guide (right, vertical, kbd style) ---
+  const keys_data = [
+    { key: "↑↓←→", label: "移動" },
+    { key: "Shift", label: "ダッシュ" },
+    { key: "R", label: "リセット" },
+  ];
+  const kFs = Math.floor(clamp(GW * 0.024, 16, 29));
+  const kbdSz = Math.floor(kFs * 1.6);
+  const kRowGap = Math.floor(kFs * 0.375);
+  const kItemGap = Math.floor(kFs * 0.4);
+  const kRight = GW - 20;
+  let ky = 16;
+  ctx.textBaseline = "middle";
+  for (const k of keys_data) {
+    ctx.font = `900 ${kFs}px sans-serif`;
+    const lw = ctx.measureText(k.label).width;
+    const ktw = ctx.measureText(k.key).width;
+    const kbdW = Math.max(kbdSz, ktw + Math.floor(kFs * 0.6));
+    const totalW = kbdW + kItemGap + lw;
+    const startX = kRight - totalW;
+
+    // kbd: white bg + box-shadow
+    ctx.save();
+    ctx.shadowColor = "rgba(0,0,0,0.3)";
+    ctx.shadowBlur = 4;
+    ctx.shadowOffsetX = 0;
+    ctx.shadowOffsetY = 2;
+    ctx.fillStyle = "#fff";
+    ctx.beginPath(); ctx.roundRect(startX, ky, kbdW, kbdSz, 6); ctx.fill();
+    ctx.restore();
+
+    // Key text
+    ctx.font = `900 ${kFs}px sans-serif`;
+    ctx.fillStyle = "#333";
+    ctx.textAlign = "center";
+    ctx.fillText(k.key, startX + kbdW / 2, ky + kbdSz / 2);
+
+    // Label
+    ctx.font = `900 ${kFs}px sans-serif`;
+    ctx.fillStyle = "#555";
+    ctx.textAlign = "left";
+    ctx.fillText(k.label, startX + kbdW + kItemGap, ky + kbdSz / 2);
+
+    ky += kbdSz + kRowGap;
+  }
+}
+
+function drawPauseOverlay() {
+  ctx.fillStyle = "rgba(0,0,0,0.5)";
+  ctx.fillRect(0, 0, GW, GH);
+  roundRect(GW / 2 - 180, GH / 2 - 70, 360, 140, 20, "rgba(30,30,50,0.85)", "rgba(255,255,255,0.15)", 2);
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.font = "bold 48px sans-serif"; ctx.fillStyle = "#fff";
+  ctx.fillText("PAUSED", GW / 2, GH / 2 - 15);
+  ctx.font = "20px sans-serif"; ctx.fillStyle = "rgb(180,200,220)";
+  ctx.fillText("ESC/P: 再開　R: リセット", GW / 2, GH / 2 + 35);
+}
+
+function drawClearOverlay(now) {
+  ctx.fillStyle = "rgba(0,0,0,0.5)";
+  ctx.fillRect(0, 0, GW, GH);
+  roundRect(GW / 2 - 220, GH / 2 - 110, 440, 220, 24, "rgba(20,40,30,0.9)", "rgba(80,255,120,0.3)", 2);
+
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+
+  // Animated "CLEAR!"
+  const bounce = Math.sin(now / 200) * 4;
+  ctx.font = "bold 56px sans-serif"; ctx.fillStyle = "rgba(0,0,0,0.3)";
+  ctx.fillText("CLEAR!", GW / 2 + 2, GH / 2 - 60 + bounce + 2);
+  ctx.fillStyle = "#5eff8a";
+  ctx.fillText("CLEAR!", GW / 2, GH / 2 - 60 + bounce);
+
+  const mins = String(Math.floor(elapsedTime / 60)).padStart(2, "0");
+  const secs = String(Math.floor(elapsedTime) % 60).padStart(2, "0");
+  ctx.font = "bold 24px sans-serif"; ctx.fillStyle = "#fff";
+  ctx.fillText(`クリアタイム: ${mins}:${secs}`, GW / 2, GH / 2 + 5);
+
+  if (bestTime > 0) {
+    const bm = String(Math.floor(bestTime / 60)).padStart(2, "0");
+    const bs = String(Math.floor(bestTime) % 60).padStart(2, "0");
+    ctx.font = "18px sans-serif"; ctx.fillStyle = "#aad";
+    ctx.fillText(`ベスト: ${bm}:${bs}`, GW / 2, GH / 2 + 38);
+  }
+
+  ctx.font = "20px sans-serif"; ctx.fillStyle = "rgb(180,200,220)";
+  ctx.fillText("SPACE / タップ: もう一度　R: リセット", GW / 2, GH / 2 + 75);
+}
+
+function drawGameOverOverlay(now) {
+  const elapsed = (now - gameOverTime) / 1000;
+
+  // (a) 暗転: 即座にフェードイン
+  const darkAlpha = Math.min(elapsed / 1.0, 0.6);
+  ctx.fillStyle = `rgba(0,0,0,${darkAlpha})`;
+  ctx.fillRect(0, 0, GW, GH);
+
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+
+  // (b) "GAME OVER" テキスト (1.5秒後〜1.5秒かけてフェードイン)
+  const textAlpha = clamp((elapsed - 1.5) / 1.5, 0, 1);
+  if (textAlpha > 0) {
+    ctx.globalAlpha = textAlpha;
+    ctx.font = `bold ${Math.floor(GW * 0.04)}px Impact, "Arial Black", sans-serif`;
+    ctx.fillStyle = "#8a2020";
+    ctx.fillText("食べすぎてもう動けないちゃむ...", GW / 2, GH / 2 - 20);
+    ctx.globalAlpha = 1;
+  }
+
+  // (c) "Rキーでリトライ" (2.5秒後〜1秒かけてフェードイン、最大70%)
+  const retryAlpha = clamp((elapsed - 2.5) / 1.0, 0, 1);
+  if (retryAlpha > 0) {
+    ctx.globalAlpha = retryAlpha * 0.7;
+    ctx.font = `${Math.floor(GW * 0.02)}px "Hiragino Kaku Gothic ProN", "Yu Gothic", sans-serif`;
+    ctx.fillStyle = "#999";
+    ctx.fillText("Rキーでリトライ", GW / 2, GH / 2 + 60);
+    ctx.globalAlpha = 1;
+  }
+}
+
+// =========================
+// Main loop
+// =========================
+let lastTime = 0;
+function loop(timestamp) {
+  const dt = Math.min((timestamp - lastTime) / 1000, 0.05);
+  lastTime = timestamp;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+
+loadImages(() => {
+  lastTime = performance.now();
+  requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>

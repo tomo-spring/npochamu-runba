@@ -25,8 +25,6 @@ const GW = 960, GH = 540;
 const RUMBA_RADIUS = 30;
 const RUMBA_MAX_SPEED = 1.5;
 const RUMBA_ACCEL = 0.2;
-const RUMBA_BOOST_MAX_SPEED = 6.0;
-const RUMBA_BOOST_ACCEL = 0.65;
 const RUMBA_FRICTION = 0.86;
 
 const CHAR_SIZE = 90; // 当たり判定用（正方形）
@@ -195,10 +193,7 @@ function playTone(freqStart, freqEnd, duration, volume = 0.3, type = "sine") {
 }
 
 // Crying sound (plays once per drag; when it ends, character detaches)
-// 通常: crying.wav, ダッシュ: crying-dash.wav
 let cryingAudio = null;
-let cryingDashAudio = null;
-let cryingCurrentMode = ""; // "normal" or "dash"
 let cryingTimer = 0;       // 音声duration分のタイマー（残り秒数）
 let cryingTimerActive = false;
 
@@ -207,11 +202,6 @@ function initCryingAudio() {
     cryingAudio = new Audio("images/crying.wav");
     cryingAudio.loop = false;
     cryingAudio.addEventListener("ended", onCryingEnded);
-  }
-  if (!cryingDashAudio) {
-    cryingDashAudio = new Audio("images/crying-dash.wav");
-    cryingDashAudio.loop = false;
-    cryingDashAudio.addEventListener("ended", onCryingEnded);
   }
 }
 
@@ -223,31 +213,16 @@ function onCryingEnded() {
     playSlip();
     screenShake = 0.12;
   }
-  cryingCurrentMode = "";
 }
 
-function startCrying(dash) {
+function startCrying() {
   initCryingAudio();
-  const wantMode = dash ? "dash" : "normal";
-  const wantAudio = dash ? cryingDashAudio : cryingAudio;
-  const otherAudio = dash ? cryingAudio : cryingDashAudio;
-  // モード切替時は再生し直す
-  if (cryingCurrentMode && cryingCurrentMode !== wantMode) {
-    if (!otherAudio.paused) { otherAudio.pause(); otherAudio.currentTime = 0; }
-    cryingCurrentMode = "";
-  }
-  if (wantAudio.paused) {
-    wantAudio.currentTime = 0;
-    wantAudio.play().catch(() => {});
-    cryingCurrentMode = wantMode;
-    // 初回再生開始時のみタイマーセット（モード切替では延長しない）
+  if (cryingAudio.paused) {
+    cryingAudio.currentTime = 0;
+    cryingAudio.play().catch(() => {});
     if (!cryingTimerActive) {
-      const dur = wantAudio.duration;
-      if (isFinite(dur) && dur > 0) {
-        cryingTimer = dur;
-      } else {
-        cryingTimer = 3; // fallback
-      }
+      const dur = cryingAudio.duration;
+      cryingTimer = (isFinite(dur) && dur > 0) ? dur : 3;
       cryingTimerActive = true;
     }
   }
@@ -255,8 +230,6 @@ function startCrying(dash) {
 
 function stopCrying() {
   if (cryingAudio && !cryingAudio.paused) { cryingAudio.pause(); cryingAudio.currentTime = 0; }
-  if (cryingDashAudio && !cryingDashAudio.paused) { cryingDashAudio.pause(); cryingDashAudio.currentTime = 0; }
-  cryingCurrentMode = "";
   cryingTimer = 0;
   cryingTimerActive = false;
 }
@@ -459,10 +432,9 @@ function update(dt) {
   if (screenShake > 0) screenShake = Math.max(0, screenShake - dt);
   if (dragAnimTimer > 0) dragAnimTimer = Math.max(0, dragAnimTimer - dt);
 
-  // Roomba input (keyboard + touch) — Shift で加速
-  const boosting = !!(keys["ShiftLeft"] || keys["ShiftRight"]);
-  const accel = boosting ? RUMBA_BOOST_ACCEL : RUMBA_ACCEL;
-  const maxSpd = boosting ? RUMBA_BOOST_MAX_SPEED : RUMBA_MAX_SPEED;
+  // Roomba input (keyboard + touch)
+  const accel = RUMBA_ACCEL;
+  const maxSpd = RUMBA_MAX_SPEED;
 
   let ax = 0, ay = 0;
   if (keys["ArrowLeft"] || keys["KeyA"]) ax -= accel;
@@ -602,7 +574,6 @@ function update(dt) {
     attached = true; hasBeenAttached = true;
     dragAnimTimer = DRAG_ANIM_DURATION; // dragging-1~6 アニメ開始
     playConnect();
-    spawnParticles(rumbaX, rumbaY, "#b4d2ff", 10, 3.0, 0.35);
   }
 
   if (attached && dist >= DETACH_RANGE) { attached = false; playSlip(); screenShake = 0.1; }
@@ -625,7 +596,7 @@ function update(dt) {
   }
 
   // Crying sound control (引きずり中＝attached かつ アニメ完了後)
-  if (attached && dragAnimTimer <= 0) startCrying(boosting);
+  if (attached && dragAnimTimer <= 0) startCrying();
   else stopCrying();
 
   // 音声duration分のタイマーで引きずり強制終了
@@ -888,7 +859,7 @@ function drawHowtoScreen(now) {
   // Title
   ctx.font = `400 ${Math.floor(GW * 0.04)}px "Zen Maru Gothic", "M PLUS Rounded 1c", sans-serif`;
   ctx.fillStyle = "#d4726a";
-  ctx.fillText("ゲーム説明", GW / 2, 40);
+  ctx.fillText("ゲーム説明", GW / 2, 55);
 
   // Rule cards
   const cards = [
@@ -912,7 +883,7 @@ function drawHowtoScreen(now) {
   const cardW = 280, cardH = 130, cardGap = 16;
   const totalW = cards.length * cardW + (cards.length - 1) * cardGap;
   let cx = (GW - totalW) / 2;
-  const cy = 75;
+  const cy = 95;
 
   for (const card of cards) {
     // Card background
@@ -963,7 +934,6 @@ function drawHowtoScreen(now) {
 
   const tips = [
     "んぽちゃむを引っ張れるのは泣いている間だけ！ 泣き止む前に安全なところへ移動しよう！",
-    "Shift を押しながらだとダッシュ！ でもんぽちゃむが嫌がってすぐ離れちゃうよ",
     "マカロンを食べるとんぽちゃむが大きくなって引きずりにくくなるから気をつけて！",
   ];
   ctx.font = `500 14px "Zen Maru Gothic", "M PLUS Rounded 1c", sans-serif`;
@@ -982,7 +952,6 @@ function drawHowtoScreen(now) {
 
   const controls = [
     { key: "↑↓←→ / WASD", label: "移動" },
-    { key: "Shift", label: "ダッシュ" },
   ];
   let cky = ctrlY + 34;
   for (const c of controls) {
@@ -1056,7 +1025,6 @@ function drawHUD(now) {
   // --- Key guide (right, vertical, kbd style) ---
   const keys_data = [
     { key: "↑↓←→", label: "移動" },
-    { key: "Shift", label: "ダッシュ" },
     { key: "R", label: "リセット" },
   ];
   const kFs = Math.floor(clamp(GW * 0.024, 16, 29));
